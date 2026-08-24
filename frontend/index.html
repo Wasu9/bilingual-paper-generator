@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Bilingual Paper Generator</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="container">
+    <h1>Bilingual Paper Generator</h1>
+    <p class="sub">PDF → English + Hindi → Editable Word</p>
+
+    <section class="card">
+      <h2>Upload English Paper PDF</h2>
+      <form id="form">
+        <input id="pdf" type="file" accept=".pdf" required>
+        <button type="submit">Generate Bilingual Word</button>
+      </form>
+      <div id="status"></div>
+      <a id="download" class="download" hidden></a>
+    </section>
+
+    <section class="rules">
+      <h3>Formatting rules</h3>
+      <ul>
+        <li>English text is kept as the source.</li>
+        <li>Hindi translation is separated from the source text.</li>
+        <li>PDF coordinates are retained for layout analysis.</li>
+        <li>Math/formulas are protected from translation.</li>
+        <li>Word output remains editable.</li>
+      </ul>
+    </section>
+  </main>
+
+<script>
+const form = document.getElementById('form');
+const status = document.getElementById('status');
+const download = document.getElementById('download');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  status.textContent = 'Processing PDF...';
+  download.hidden = true;
+
+  const fd = new FormData();
+  fd.append('file', document.getElementById('pdf').files[0]);
+
+  try {
+    const res = await fetch('/api/generate', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Generation failed');
+
+    status.textContent = `Done: ${data.pages} page(s), ${data.questions} detected question(s).`;
+    download.href = data.download;
+    download.textContent = 'Download Word file';
+    download.hidden = false;
+  } catch (err) {
+    status.textContent = err.message;
+  }
+});
+</script>
+</body>
+</html>
