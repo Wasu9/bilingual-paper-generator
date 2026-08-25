@@ -13,35 +13,43 @@ except ImportError:
 QUESTION_RE = re.compile(r"^\s*(?:Q\.?\s*)?(\d{1,3})[\.\)]\s*")
 MATH_TOKEN_RE = re.compile(r"__MATH_\d+__")
 SECTION_RE = re.compile(r"^\s*(PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY|BOTANY|ZOOLOGY)\s*$", re.I)
+
 def _strip_json_fence(text: str) -> str:
     text = (text or "").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json|text)?\s*", "", text, flags=re.I)
         text = re.sub(r"\s*```$", "", text)
     return text.strip()
+
 def _remove_question_number(text: str) -> str:
     return QUESTION_RE.sub("", text or "", count=1).strip()
+
 def _has_hindi(text: str) -> bool:
     return any("\u0900" <= c <= "\u097F" for c in str(text or ""))
+
 def _is_math_only(text: str) -> bool:
     return not MATH_TOKEN_RE.sub("", text or "").strip()
+
 def _is_nonlinguistic_fragment(text: str) -> bool:
     value = MATH_TOKEN_RE.sub("", str(text or "")).strip()
     if not value:
         return True
     return bool(re.fullmatch(r"(?:\(?[A-Da-d]\)?|[0-9]+|[ivxIVX]+|[\W_]+)", value))
+
 def _is_transient_error(exc: Exception) -> bool:
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     if code in {408, 429, 500, 502, 503, 504}:
         return True
     text = str(exc).upper()
     return any(token in text for token in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "502", "504"))
+
 class DemoTranslator:
     def __init__(self, api_key: str = ""):
         self.api_key = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
         self.model = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
         self.fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash").strip()
         self.client = genai.Client(api_key=self.api_key) if self.api_key and genai else None
+
     def _call_model(self, model: str, prompt: str, json_mode: bool = True):
         last_error = None
         for attempt in range(3):
@@ -54,6 +62,7 @@ class DemoTranslator:
                     break
                 time.sleep(2 ** attempt)
         raise last_error or RuntimeError("Gemini request failed")
+
     def _parse_response(self, response_text: str) -> dict[str, str]:
         raw = _strip_json_fence(response_text)
         try:
@@ -74,11 +83,13 @@ class DemoTranslator:
                 result[key] = value
             result[f"__index_{index}"] = value
         return result
+
     def _models(self):
         models = [self.model]
         if self.fallback_model and self.fallback_model not in models:
             models.append(self.fallback_model)
         return models
+
     def _translate_batch(self, items: list[dict[str, str]]) -> dict[str, str]:
         if not items:
             return {}
@@ -118,6 +129,7 @@ INPUT:
                 if not _is_transient_error(exc):
                     raise
         raise RuntimeError(f"Gemini translation service is temporarily unavailable: {last_error}") from last_error
+
     def _translate_single(self, item: dict[str, str], preferred_model: str | None = None) -> str:
         source = item.get("text", "").strip()
         if _is_math_only(source) or _is_nonlinguistic_fragment(source):
@@ -147,6 +159,43 @@ TEXT:
             except Exception:
                 pass
         return ""
+
+    def _merge_question_block_text(self, blocks: list[dict]) -> list[dict]:
+        """Merge fragmented PDF text blocks belonging to the same question line.
+
+        PyMuPDF frequently returns one visual sentence as several adjacent blocks
+        when the source PDF has mixed fonts/math spans. Sending each fragment to
+        Gemini independently causes tiny IDs like b4 to be omitted. Merge adjacent
+        text blocks that are on the same page/column and vertically adjacent,
+        while preserving images and explicit question starts.
+        """
+        out: list[dict] = []
+        for block in blocks:
+            if not out or block.get("type") != "text" or out[-1].get("type") != "text":
+                out.append(block)
+                continue
+            prev = out[-1]
+            pb = prev.get("bbox", [0,0,0,0]); cb = block.get("bbox", [0,0,0,0])
+            same_page = prev.get("page") == block.get("page")
+            same_col = prev.get("column") == block.get("column")
+            vertical_gap = float(cb[1]) - float(pb[3])
+            overlaps_y = not (float(cb[1]) > float(pb[3]) + 14 or float(pb[1]) > float(cb[3]) + 14)
+            starts_q = bool(QUESTION_RE.match(str(block.get("text", ""))))
+            prev_is_complete = str(prev.get("text", "")).rstrip().endswith((".", ":", "?"))
+            if same_page and same_col and not starts_q and vertical_gap <= 8 and (overlaps_y or not prev_is_complete):
+                prev_text = str(prev.get("text", "")).strip()
+                cur_text = str(block.get("text", "")).strip()
+                prev_source = str(prev.get("translation_source") or prev_text).strip()
+                cur_source = str(block.get("translation_source") or cur_text).strip()
+                prev["text"] = (prev_text + " " + cur_text).strip()
+                prev["translation_source"] = (prev_source + " " + cur_source).strip()
+                prev["lines"] = list(prev.get("lines", [])) + list(block.get("lines", []))
+                prev["math_values"] = list(prev.get("math_values", [])) + list(block.get("math_values", []))
+                prev["bbox"] = [min(pb[0],cb[0]), min(pb[1],cb[1]), max(pb[2],cb[2]), max(pb[3],cb[3])]
+                continue
+            out.append(block)
+        return out
+
     def translate_document(self, document: dict) -> dict:
         questions: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
@@ -157,6 +206,7 @@ TEXT:
             nonlocal current
             if not current:
                 return
+            current["blocks"] = self._merge_question_block_text(current["blocks"])
             queue = []
             for block in current["blocks"]:
                 if block.get("type") != "text":
