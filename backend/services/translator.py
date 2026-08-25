@@ -19,9 +19,9 @@ SECTION_RE = re.compile(r"^\s*(PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY|BOTANY|ZOOL
 
 
 def _strip_json_fence(text: str) -> str:
-    text = text.strip()
+    text = (text or "").strip()
     if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"^```(?:json|text)?\s*", "", text, flags=re.I)
         text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
@@ -42,9 +42,7 @@ def _is_nonlinguistic_fragment(text: str) -> bool:
     value = MATH_TOKEN_RE.sub("", str(text or "")).strip()
     if not value:
         return True
-    if re.fullmatch(r"(?:\(?[A-Da-d]\)?|[0-9]+|[ivxIVX]+|[\W_]+)", value):
-        return True
-    return False
+    return bool(re.fullmatch(r"(?:\(?[A-Da-d]\)?|[0-9]+|[ivxIVX]+|[\W_]+)", value))
 
 
 def _is_transient_error(exc: Exception) -> bool:
@@ -58,19 +56,20 @@ def _is_transient_error(exc: Exception) -> bool:
 class DemoTranslator:
     def __init__(self, api_key: str = ""):
         self.api_key = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
-        self.model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
-        self.fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash").strip()
+        # Current stable production models. Gemini 3.7 Flash is the newest
+        # stable Flash model; 3.6/3.5 remain valid fallbacks.
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
+        self.fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash").strip()
         self.client = genai.Client(api_key=self.api_key) if self.api_key and genai else None
 
-    def _call_model(self, model: str, prompt: str):
+    def _call_model(self, model: str, prompt: str, json_mode: bool = True):
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                return self.client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                config = types.GenerateContentConfig(
+                    response_mime_type="application/json" if json_mode else "text/plain"
                 )
+                return self.client.models.generate_content(model=model, contents=prompt, config=config)
             except Exception as exc:
                 last_error = exc
                 if not _is_transient_error(exc) or attempt == 2:
@@ -79,11 +78,15 @@ class DemoTranslator:
         raise last_error or RuntimeError("Gemini request failed")
 
     def _parse_response(self, response_text: str) -> dict[str, str]:
-        raw = _strip_json_fence(response_text or "[]")
+        raw = _strip_json_fence(response_text)
         try:
             parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Gemini returned invalid translation JSON: {exc}") from exc
+        except json.JSONDecodeError:
+            # Some valid Gemini responses contain Hindi but don't obey the JSON
+            # envelope. For recovery requests, keep the Hindi text itself.
+            if _has_hindi(raw):
+                return {"__index_0": raw}
+            return {}
 
         if isinstance(parsed, dict):
             parsed = [parsed]
@@ -97,8 +100,6 @@ class DemoTranslator:
             key = str(item.get("id", ""))
             if key:
                 result[key] = value
-            # Also keep an internal positional key so a model that changes the
-            # requested ID can still be recovered for a one-item request.
             result[f"__index_{index}"] = value
         return result
 
@@ -121,11 +122,10 @@ Return ONLY a JSON array with one object for EVERY input item:
 Rules:
 1. Translate every natural-language English word faithfully. Do not solve, explain, shorten, or add content.
 2. Preserve complete meaning and original wording.
-3. Every __MATH_n__ token is an exact mathematical fragment from the source. Preserve every token exactly,
-   in the same position, with the same spelling. Never translate, remove, merge, reorder, or invent math tokens.
-4. Preserve numbers, units, symbols, variables, option markers, set notation, scientific symbols and formula tokens.
+3. Every __MATH_n__ token is an exact mathematical fragment from the source. Preserve every token exactly, in the same position.
+4. Preserve numbers, units, symbols, variables, option markers, set notation and scientific symbols.
 5. Use standard NCERT Hindi terminology.
-6. Preserve source line breaks (\\n) in the same positions.
+6. Preserve source line breaks (\\n).
 7. Hindi must contain real Devanagari characters.
 8. Never omit an input item, even if it is short.
 
@@ -135,13 +135,12 @@ INPUT:
         last_error: Exception | None = None
         for model in self._models():
             try:
-                response = self._call_model(model, prompt)
+                response = self._call_model(model, prompt, json_mode=True)
                 parsed = self._parse_response(response.text or "[]")
                 result = {k: v for k, v in parsed.items() if not k.startswith("__index_")}
                 missing = [item for item in items if not result.get(item["id"])]
                 if not missing:
                     return result
-                # Recover every omitted item separately.
                 for item in missing:
                     value = self._translate_single(item, model)
                     if value:
@@ -161,33 +160,44 @@ INPUT:
         if _is_math_only(source) or _is_nonlinguistic_fragment(source):
             return source
 
-        prompt = f"""Translate this single competitive-exam text into formal NCERT-style Hindi.
-Return ONLY JSON with exactly one object. The ID is optional; the Hindi value is mandatory:
-{{"id":"{item['id']}","hindi":"translation"}}
-
-Rules:
-- Translate every natural-language English word; do not explain or solve.
-- Preserve every __MATH_n__ token exactly, including spelling, order and position.
-- Preserve numbers, units, symbols, variables and line breaks.
-- Use real Devanagari Hindi.
-- Do not return English-only text.
+        # First ask for plain Hindi rather than JSON. This avoids the common
+        # failure where a short block is omitted by structured-output decoding.
+        plain_prompt = f"""Translate ONLY the following text into formal NCERT-style Hindi.
+Do not explain, solve, summarize, or add anything.
+Preserve every __MATH_n__ token exactly, including its spelling, order and position.
+Preserve numbers, units, symbols, variables and line breaks.
+Use real Devanagari Hindi. Return ONLY the Hindi translation.
 
 TEXT:
-{json.dumps(source, ensure_ascii=False)}"""
+{source}"""
 
         models = [preferred_model] if preferred_model else []
         models.extend(m for m in self._models() if m not in models)
+        last_error: Exception | None = None
         for model in models:
             try:
-                response = self._call_model(model, prompt)
+                response = self._call_model(model, plain_prompt, json_mode=False)
+                value = _strip_json_fence(response.text or "")
+                if _has_hindi(value):
+                    return value
+            except Exception as exc:
+                last_error = exc
+                if not _is_transient_error(exc):
+                    continue
+
+            # Second attempt for this same item with a tiny JSON contract.
+            try:
+                response = self._call_model(
+                    model,
+                    f'''Return ONLY JSON: {{"hindi":"..."}}\nTranslate to NCERT-style Hindi. Preserve __MATH_n__ tokens exactly.\nTEXT: {source}''',
+                    json_mode=True,
+                )
                 parsed = self._parse_response(response.text or "{}")
-                if item["id"] in parsed:
-                    return parsed[item["id"]]
                 if parsed.get("__index_0"):
                     return parsed["__index_0"]
             except Exception as exc:
-                if not _is_transient_error(exc):
-                    break
+                last_error = exc
+                continue
         return ""
 
     def translate_document(self, document: dict) -> dict:
@@ -264,7 +274,7 @@ TEXT:
                 copied["hindi"] = ""
                 item_counter += 1
                 copied["_translation_id"] = f"b{item_counter}"
-                current["blocks"].append(copied)
+                current["blocks"].append(copied]
 
         flush_question()
         questions.sort(key=lambda q: int(q.get("number", 0)))
