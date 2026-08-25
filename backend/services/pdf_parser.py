@@ -1,18 +1,18 @@
-"""Layout-aware PDF extraction.
+"""Layout-aware PDF extraction for bilingual paper generation."""
 
-Keeps coordinates and embedded figures so the DOCX renderer can reproduce the
-source paper's question/option layout much more faithfully.
-"""
-
-import fitz
 import re
 from pathlib import Path
 
+import fitz
+
 QUESTION_RE = re.compile(r"^\s*(?:Q\.?\s*)?(\d{1,3})[\.\)]\s*")
+HEADER_RE = re.compile(r"^\s*(English\s+हिंदी|I\s+PUC\s+JEE\s*\(MAINS\)|Page\s+\d+)\s*$", re.I)
 
 
 def _clean(text: str) -> str:
+    text = text.replace("\u00a0", " ")
     text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
     return text.strip()
 
 
@@ -33,7 +33,7 @@ def _is_question_only_number(text: str) -> bool:
 
 def _merge_question_number_blocks(blocks: list[dict]) -> list[dict]:
     """Join a standalone question number with the text immediately after it."""
-    result = []
+    result: list[dict] = []
     i = 0
     while i < len(blocks):
         block = blocks[i]
@@ -41,7 +41,7 @@ def _merge_question_number_blocks(blocks: list[dict]) -> list[dict]:
             nxt = blocks[i + 1]
             b1, b2 = block["bbox"], nxt["bbox"]
             same_column = abs(b1[0] - b2[0]) < 30 or block.get("column") == nxt.get("column")
-            close_vertically = b2[1] - b1[3] < 14
+            close_vertically = 0 <= b2[1] - b1[3] < 18
             if same_column and close_vertically:
                 merged = dict(nxt)
                 merged["text"] = f"{block['text'].strip()} {nxt['text'].strip()}".strip()
@@ -69,13 +69,12 @@ def extract_document(pdf_path: Path) -> dict:
 
         for block_index, block in enumerate(data.get("blocks", [])):
             bbox = list(block.get("bbox", [0, 0, 0, 0]))
+            x0, y0, x1, y1 = bbox
 
-            # Embedded PDF images: keep figures/diagrams, but ignore small page
-            # header logos and decorative marks near the top margin.
+            # Keep useful diagrams/graphs. Small logos/header images are ignored.
             if block.get("type") == 1:
-                x0, y0, x1, y1 = bbox
                 width, height = x1 - x0, y1 - y0
-                if y0 > 75 and width > 70 and height > 45:
+                if y0 > 55 and width > 45 and height > 35:
                     image_bytes = block.get("image")
                     if image_bytes:
                         ext = block.get("ext", "png")
@@ -103,13 +102,12 @@ def extract_document(pdf_path: Path) -> dict:
                 spans = line.get("spans", [])
                 txt = "".join(span.get("text", "") for span in spans)
                 if txt.strip():
-                    lines.append(txt)
+                    lines.append(txt.strip())
 
             text = _clean("\n".join(lines))
-            if not text:
+            if not text or HEADER_RE.fullmatch(text):
                 continue
 
-            x0, y0, x1, y1 = bbox
             blocks.append({
                 "page": page_no,
                 "type": "text",
