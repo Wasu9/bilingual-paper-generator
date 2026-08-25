@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import time
 from typing import Any
 
 try:
@@ -42,13 +43,41 @@ def _is_math_only(text: str) -> bool:
     return not MATH_TOKEN_RE.sub("", text or "").strip()
 
 
+def _is_transient_error(exc: Exception) -> bool:
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if code in {408, 429, 500, 502, 503, 504}:
+        return True
+    text = str(exc).upper()
+    return any(token in text for token in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "502", "504"))
+
+
 class DemoTranslator:
     """Gemini translator used by the production paper-generation pipeline."""
 
     def __init__(self, api_key: str = ""):
         self.api_key = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
-        self.model = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+        self.fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash").strip()
         self.client = genai.Client(api_key=self.api_key) if self.api_key and genai else None
+
+    def _call_model(self, model: str, prompt: str):
+        last_error: Exception | None = None
+        # The Gemini API documents 503 as temporary overload and recommends
+        # retrying with exponential backoff. The SDK also has transient retries;
+        # these additional attempts mainly provide a model fallback for capacity spikes.
+        for attempt in range(3):
+            try:
+                return self.client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+            except Exception as exc:
+                last_error = exc
+                if not _is_transient_error(exc) or attempt == 2:
+                    break
+                time.sleep(2 ** attempt)
+        raise last_error or RuntimeError("Gemini request failed")
 
     def _translate_batch(self, items: list[dict[str, str]], retry: bool = False) -> dict[str, str]:
         if not items:
@@ -75,11 +104,22 @@ Rules:
 INPUT:
 {json.dumps(items, ensure_ascii=False)}"""
 
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
-        )
+        models_to_try = [self.model]
+        if self.fallback_model and self.fallback_model not in models_to_try:
+            models_to_try.append(self.fallback_model)
+
+        last_error: Exception | None = None
+        for model in models_to_try:
+            try:
+                response = self._call_model(model, prompt)
+                break
+            except Exception as exc:
+                last_error = exc
+                if not _is_transient_error(exc):
+                    raise
+        else:
+            raise RuntimeError(f"Gemini translation service is temporarily unavailable: {last_error}") from last_error
+
         try:
             parsed = json.loads(_strip_json_fence(response.text or "[]"))
         except json.JSONDecodeError as exc:
