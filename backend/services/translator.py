@@ -43,6 +43,25 @@ def _is_transient_error(exc: Exception) -> bool:
     text = str(exc).upper()
     return any(token in text for token in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "502", "504"))
 
+def _extract_json_value(text: str) -> Any:
+    """Best-effort JSON extraction without relying on the SDK JSON decoder."""
+    raw = _strip_json_fence(text)
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    starts = [i for i in (raw.find("["), raw.find("{")) if i >= 0]
+    if not starts:
+        return None
+    start = min(starts)
+    for end in range(len(raw), start, -1):
+        candidate = raw[start:end].strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
+    return None
+
 class DemoTranslator:
     def __init__(self, api_key: str = ""):
         self.api_key = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
@@ -50,11 +69,14 @@ class DemoTranslator:
         self.fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash").strip()
         self.client = genai.Client(api_key=self.api_key) if self.api_key and genai else None
 
-    def _call_model(self, model: str, prompt: str, json_mode: bool = True):
+    def _call_model(self, model: str, prompt: str, json_mode: bool = False):
         last_error = None
         for attempt in range(3):
             try:
-                config = types.GenerateContentConfig(response_mime_type="application/json" if json_mode else "text/plain")
+                # Use plain text transport even for prompts that request JSON.
+                # This prevents malformed/truncated structured output from being
+                # parsed by the SDK before our own recovery code can run.
+                config = types.GenerateContentConfig(response_mime_type="text/plain")
                 return self.client.models.generate_content(model=model, contents=prompt, config=config)
             except Exception as exc:
                 last_error = exc
@@ -65,9 +87,8 @@ class DemoTranslator:
 
     def _parse_response(self, response_text: str) -> dict[str, str]:
         raw = _strip_json_fence(response_text)
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
+        parsed = _extract_json_value(raw)
+        if parsed is None:
             return {"__index_0": raw} if _has_hindi(raw) else {}
         if isinstance(parsed, dict):
             parsed = [parsed]
@@ -112,10 +133,18 @@ INPUT:
         last_error = None
         for model in self._models():
             try:
-                response = self._call_model(model, prompt, json_mode=True)
-                parsed = self._parse_response(response.text or "[]")
+                response = self._call_model(model, prompt, json_mode=False)
+                parsed = self._parse_response(response.text or "")
                 result = {k: v for k, v in parsed.items() if not k.startswith("__index_")}
+                indexed = {k: v for k, v in parsed.items() if k.startswith("__index_")}
                 missing = [item for item in items if not result.get(item["id"])]
+                # If the model returned a valid ordered array but dropped ids,
+                # recover those entries by their original batch position.
+                for index, item in enumerate(items):
+                    if not result.get(item["id"]) and indexed.get(f"__index_{index}"):
+                        result[item["id"]] = indexed[f"__index_{index}"]
+                missing = [item for item in items if not result.get(item["id"])]
+                # Recover missing entries individually instead of failing the whole paper.
                 for item in missing:
                     value = self._translate_single(item, model)
                     if value:
@@ -152,7 +181,7 @@ TEXT:
             except Exception:
                 pass
             try:
-                response = self._call_model(model, f'''Return ONLY JSON: {{"hindi":"..."}}\nTranslate to NCERT-style Hindi. Preserve __MATH_n__ tokens exactly.\nTEXT: {source}''', json_mode=True)
+                response = self._call_model(model, f'''Return ONLY JSON: {{"hindi":"..."}}\nTranslate to NCERT-style Hindi. Preserve __MATH_n__ tokens exactly.\nTEXT: {source}''', json_mode=False)
                 parsed = self._parse_response(response.text or "{}")
                 if parsed.get("__index_0"):
                     return parsed["__index_0"]
@@ -161,14 +190,7 @@ TEXT:
         return ""
 
     def _merge_question_block_text(self, blocks: list[dict]) -> list[dict]:
-        """Merge fragmented PDF text blocks belonging to the same question line.
-
-        PyMuPDF frequently returns one visual sentence as several adjacent blocks
-        when the source PDF has mixed fonts/math spans. Sending each fragment to
-        Gemini independently causes tiny IDs like b4 to be omitted. Merge adjacent
-        text blocks that are on the same page/column and vertically adjacent,
-        while preserving images and explicit question starts.
-        """
+        """Merge fragmented PDF text blocks belonging to the same question line."""
         out: list[dict] = []
         for block in blocks:
             if not out or block.get("type") != "text" or out[-1].get("type") != "text":
@@ -257,10 +279,6 @@ TEXT:
                     pending_section = None
                     started = True
                 if current is None:
-                    if "marking scheme" in text.lower() or "single correct choice type" in text.lower() or "numerical value answer type" in text.lower():
-                        started = True
-                    continue
-                if not started:
                     continue
                 copied = dict(block)
                 copied["english"] = text
