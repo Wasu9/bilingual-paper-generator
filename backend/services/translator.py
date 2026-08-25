@@ -43,6 +43,17 @@ def _is_math_only(text: str) -> bool:
     return not MATH_TOKEN_RE.sub("", text or "").strip()
 
 
+def _is_nonlinguistic_fragment(text: str) -> bool:
+    """True for labels/symbols that do not require a Hindi translation."""
+    value = MATH_TOKEN_RE.sub("", str(text or "")).strip()
+    if not value:
+        return True
+    # Option labels, isolated letters, numbers and punctuation are layout data.
+    if re.fullmatch(r"(?:\(?[A-Da-d]\)?|[0-9]+|[ivxIVX]+|[\W_]+)", value):
+        return True
+    return False
+
+
 def _is_transient_error(exc: Exception) -> bool:
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     if code in {408, 429, 500, 502, 503, 504}:
@@ -62,9 +73,6 @@ class DemoTranslator:
 
     def _call_model(self, model: str, prompt: str):
         last_error: Exception | None = None
-        # The Gemini API documents 503 as temporary overload and recommends
-        # retrying with exponential backoff. The SDK also has transient retries;
-        # these additional attempts mainly provide a model fallback for capacity spikes.
         for attempt in range(3):
             try:
                 return self.client.models.generate_content(
@@ -79,13 +87,28 @@ class DemoTranslator:
                 time.sleep(2 ** attempt)
         raise last_error or RuntimeError("Gemini request failed")
 
+    def _parse_response(self, response_text: str) -> dict[str, str]:
+        try:
+            parsed = json.loads(_strip_json_fence(response_text or "[]"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Gemini returned invalid translation JSON: {exc}") from exc
+
+        result: dict[str, str] = {}
+        for item in parsed if isinstance(parsed, list) else []:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            value = str(item.get("hindi", "")).strip()
+            if value and (_has_hindi(value) or _is_math_only(value)):
+                result[str(item["id"])] = value
+        return result
+
     def _translate_batch(self, items: list[dict[str, str]], retry: bool = False) -> dict[str, str]:
         if not items:
             return {}
         if not self.client:
             raise RuntimeError("GEMINI_API_KEY is not configured")
 
-        strict = "" if not retry else "\nIMPORTANT: Previous output was incomplete. Every item MUST contain a non-empty Hindi translation containing Devanagari characters. Return every ID exactly once."
+        strict = "" if not retry else "\nIMPORTANT: Return every ID exactly once. Do not omit even a short item."
         prompt = f"""Translate the following competitive-exam paper text from English to clear, formal NCERT-style Hindi.{strict}
 Return ONLY a JSON array:
 [{{"id":"same-id","hindi":"translation"}}]
@@ -99,7 +122,7 @@ Rules:
 5. Use standard NCERT Hindi terminology. Keep unavoidable technical terms in English only when appropriate.
 6. Preserve source line breaks (\\n) in the same positions.
 7. Hindi must be real Devanagari Hindi, not transliterated English.
-8. Return one object for EVERY input ID.
+8. Return one object for EVERY input ID, including very short text fragments.
 
 INPUT:
 {json.dumps(items, ensure_ascii=False)}"""
@@ -112,33 +135,67 @@ INPUT:
         for model in models_to_try:
             try:
                 response = self._call_model(model, prompt)
-                break
+                return self._recover_missing(items, self._parse_response(response.text or "[]"), retry=retry)
             except Exception as exc:
                 last_error = exc
                 if not _is_transient_error(exc):
                     raise
-        else:
-            raise RuntimeError(f"Gemini translation service is temporarily unavailable: {last_error}") from last_error
+        raise RuntimeError(f"Gemini translation service is temporarily unavailable: {last_error}") from last_error
 
-        try:
-            parsed = json.loads(_strip_json_fence(response.text or "[]"))
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Gemini returned invalid translation JSON: {exc}") from exc
+    def _recover_missing(self, items: list[dict[str, str]], result: dict[str, str], retry: bool = False) -> dict[str, str]:
+        missing = [item for item in items if not result.get(item["id"])]
+        if not missing:
+            return result
 
-        result: dict[str, str] = {}
-        for item in parsed if isinstance(parsed, list) else []:
-            if not isinstance(item, dict) or "id" not in item:
+        # Do not let one omitted short block abort the whole paper. Retry each
+        # missing natural-language block individually; this is much more reliable
+        # than sending the same incomplete batch again.
+        recovered = dict(result)
+        for item in missing:
+            item_id = item["id"]
+            source = item.get("text", "").strip()
+            if _is_math_only(source) or _is_nonlinguistic_fragment(source):
+                recovered[item_id] = source
                 continue
-            value = str(item.get("hindi", "")).strip()
-            if value and (_has_hindi(value) or _is_math_only(value)):
-                result[str(item["id"])] = value
+            single = self._translate_single(item)
+            if single:
+                recovered[item_id] = single
 
-        missing = [item["id"] for item in items if not result.get(item["id"])]
-        if missing and not retry:
-            return self._translate_batch([item for item in items if item["id"] in missing], retry=True) | {k: v for k, v in result.items() if k not in missing}
-        if missing:
-            raise RuntimeError("Gemini did not return usable Hindi for: " + ", ".join(missing))
-        return result
+        still_missing = [item["id"] for item in items if not recovered.get(item["id"])]
+        if still_missing:
+            raise RuntimeError("Gemini did not return usable Hindi for: " + ", ".join(still_missing))
+        return recovered
+
+    def _translate_single(self, item: dict[str, str]) -> str:
+        source = item.get("text", "").strip()
+        prompt = f"""Translate this single competitive-exam text into formal NCERT-style Hindi.
+Return ONLY a JSON array with exactly one object: [{{\"id\":\"{item['id']}\",\"hindi\":\"...\"}}]
+
+Rules:
+- Translate every natural-language English word; do not explain or solve.
+- Preserve every __MATH_n__ token exactly, including spelling, order and position.
+- Preserve numbers, units, symbols, variables and line breaks.
+- Use real Devanagari Hindi.
+- Never omit the requested ID.
+
+TEXT:
+{json.dumps(source, ensure_ascii=False)}"""
+        models_to_try = [self.model]
+        if self.fallback_model and self.fallback_model not in models_to_try:
+            models_to_try.append(self.fallback_model)
+        last_error: Exception | None = None
+        for model in models_to_try:
+            try:
+                response = self._call_model(model, prompt)
+                result = self._parse_response(response.text or "[]")
+                value = result.get(item["id"], "").strip()
+                if value:
+                    return value
+            except Exception as exc:
+                last_error = exc
+                if not _is_transient_error(exc):
+                    break
+        return ""
 
     def translate_document(self, document: dict) -> dict:
         questions: list[dict[str, Any]] = []
@@ -160,7 +217,7 @@ INPUT:
                 clean_source = _remove_question_number(source)
                 if not clean_source:
                     continue
-                if _is_math_only(clean_source):
+                if _is_math_only(clean_source) or _is_nonlinguistic_fragment(clean_source):
                     block["hindi"] = clean_source
                     continue
                 item_counter_id = block.get("_translation_id")
@@ -208,7 +265,6 @@ INPUT:
                     pending_section = None
                     started = True
 
-                # Keep instructions/section descriptions only after the paper has started.
                 if current is None:
                     if "marking scheme" in text.lower() or "single correct choice type" in text.lower() or "numerical value answer type" in text.lower():
                         started = True
@@ -224,8 +280,5 @@ INPUT:
                 current["blocks"].append(copied)
 
         flush_question()
-
-        # Keep the real question order. Do not silently drop valid questions if
-        # a PDF page contains a layout/header block between question numbers.
         questions.sort(key=lambda q: int(q.get("number", 0)))
         return {"questions": questions, "source": document}
