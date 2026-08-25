@@ -4,15 +4,18 @@ import os
 import re
 import time
 from typing import Any
+
 try:
     from google import genai
     from google.genai import types
 except ImportError:
     genai = None
     types = None
+
 QUESTION_RE = re.compile(r"^\s*(?:Q\.?\s*)?(\d{1,3})[\.\)]\s*")
 MATH_TOKEN_RE = re.compile(r"__MATH_\d+__")
 SECTION_RE = re.compile(r"^\s*(PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY|BOTANY|ZOOLOGY)\s*$", re.I)
+
 
 def _strip_json_fence(text: str) -> str:
     text = (text or "").strip()
@@ -21,14 +24,18 @@ def _strip_json_fence(text: str) -> str:
         text = re.sub(r"\s*```$", "", text)
     return text.strip()
 
+
 def _remove_question_number(text: str) -> str:
     return QUESTION_RE.sub("", text or "", count=1).strip()
+
 
 def _has_hindi(text: str) -> bool:
     return any("\u0900" <= c <= "\u097F" for c in str(text or ""))
 
+
 def _is_math_only(text: str) -> bool:
     return not MATH_TOKEN_RE.sub("", text or "").strip()
+
 
 def _is_nonlinguistic_fragment(text: str) -> bool:
     value = MATH_TOKEN_RE.sub("", str(text or "")).strip()
@@ -36,12 +43,14 @@ def _is_nonlinguistic_fragment(text: str) -> bool:
         return True
     return bool(re.fullmatch(r"(?:\(?[A-Da-d]\)?|[0-9]+|[ivxIVX]+|[\W_]+)", value))
 
+
 def _is_transient_error(exc: Exception) -> bool:
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     if code in {408, 429, 500, 502, 503, 504}:
         return True
     text = str(exc).upper()
     return any(token in text for token in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "502", "504"))
+
 
 def _extract_json_value(text: str) -> Any:
     """Best-effort JSON extraction without relying on the SDK JSON decoder."""
@@ -62,6 +71,7 @@ def _extract_json_value(text: str) -> Any:
             continue
     return None
 
+
 class DemoTranslator:
     def __init__(self, api_key: str = ""):
         self.api_key = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
@@ -71,19 +81,36 @@ class DemoTranslator:
 
     def _call_model(self, model: str, prompt: str, json_mode: bool = False):
         last_error = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
-                # Use plain text transport even for prompts that request JSON.
-                # This prevents malformed/truncated structured output from being
-                # parsed by the SDK before our own recovery code can run.
+                # Always request plain text. We parse JSON ourselves so a malformed
+                # structured response cannot be rejected by the SDK before recovery.
                 config = types.GenerateContentConfig(response_mime_type="text/plain")
-                return self.client.models.generate_content(model=model, contents=prompt, config=config)
+                return self.client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
             except Exception as exc:
                 last_error = exc
-                if not _is_transient_error(exc) or attempt == 2:
+                if not _is_transient_error(exc) or attempt == 3:
                     break
                 time.sleep(2 ** attempt)
         raise last_error or RuntimeError("Gemini request failed")
+
+    def _response_text(self, response) -> str:
+        """Read Gemini text robustly even when response.text is empty."""
+        value = str(getattr(response, "text", "") or "").strip()
+        if value:
+            return value
+        parts = []
+        for candidate in getattr(response, "candidates", []) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", []) or []:
+                text = getattr(part, "text", None)
+                if text:
+                    parts.append(str(text))
+        return "\n".join(parts).strip()
 
     def _parse_response(self, response_text: str) -> dict[str, str]:
         raw = _strip_json_fence(response_text)
@@ -106,9 +133,14 @@ class DemoTranslator:
         return result
 
     def _models(self):
-        models = [self.model]
-        if self.fallback_model and self.fallback_model not in models:
-            models.append(self.fallback_model)
+        # Keep a known-stable fallback chain. 2.5 Flash remains available while
+        # newer 3.x endpoints can occasionally experience temporary load spikes.
+        configured = [self.model, self.fallback_model, "gemini-2.5-flash"]
+        models = []
+        for model in configured:
+            model = (model or "").strip()
+            if model and model not in models:
+                models.append(model)
         return models
 
     def _translate_batch(self, items: list[dict[str, str]]) -> dict[str, str]:
@@ -116,6 +148,7 @@ class DemoTranslator:
             return {}
         if not self.client:
             raise RuntimeError("GEMINI_API_KEY is not configured")
+
         prompt = f'''Translate the following competitive-exam paper text from English to clear, formal NCERT-style Hindi.
 Return ONLY a JSON array with one object for EVERY input item:
 [{{"id":"same-id","hindi":"translation"}}]
@@ -128,65 +161,110 @@ Rules:
 6. Preserve source line breaks.
 7. Hindi must contain real Devanagari characters.
 8. Never omit an input item.
+9. If an item is short, translate it anyway; do not return it in English.
 INPUT:
 {json.dumps(items, ensure_ascii=False)}'''
+
         last_error = None
         for model in self._models():
             try:
-                response = self._call_model(model, prompt, json_mode=False)
-                parsed = self._parse_response(response.text or "")
+                response = self._call_model(model, prompt)
+                parsed = self._parse_response(self._response_text(response))
                 result = {k: v for k, v in parsed.items() if not k.startswith("__index_")}
                 indexed = {k: v for k, v in parsed.items() if k.startswith("__index_")}
-                missing = [item for item in items if not result.get(item["id"])]
-                # If the model returned a valid ordered array but dropped ids,
-                # recover those entries by their original batch position.
+
+                # Recover valid ordered output when the model omitted ids.
                 for index, item in enumerate(items):
                     if not result.get(item["id"]) and indexed.get(f"__index_{index}"):
                         result[item["id"]] = indexed[f"__index_{index}"]
+
                 missing = [item for item in items if not result.get(item["id"])]
-                # Recover missing entries individually instead of failing the whole paper.
+                # Retry missing blocks individually. This is important for PDF
+                # fragments such as option lines, labels, or mixed math/text.
                 for item in missing:
                     value = self._translate_single(item, model)
                     if value:
                         result[item["id"]] = value
+
                 still_missing = [item["id"] for item in items if not result.get(item["id"])]
                 if not still_missing:
                     return result
-                raise RuntimeError("Gemini did not return usable Hindi for: " + ", ".join(still_missing))
+
+                last_error = RuntimeError(
+                    "Gemini did not return usable Hindi for: " + ", ".join(still_missing)
+                )
             except Exception as exc:
                 last_error = exc
+                # A transient failure on one model should move to the next model.
                 if not _is_transient_error(exc):
-                    raise
-        raise RuntimeError(f"Gemini translation service is temporarily unavailable: {last_error}") from last_error
+                    continue
+
+        raise RuntimeError(
+            f"Gemini translation failed after fallback retries: {last_error}"
+        ) from last_error
 
     def _translate_single(self, item: dict[str, str], preferred_model: str | None = None) -> str:
         source = item.get("text", "").strip()
         if _is_math_only(source) or _is_nonlinguistic_fragment(source):
             return source
+
         plain_prompt = f'''Translate ONLY the following text into formal NCERT-style Hindi.
 Do not explain, solve, summarize, or add anything.
 Preserve every __MATH_n__ token exactly, including its spelling, order and position.
 Preserve numbers, units, symbols, variables and line breaks.
-Use real Devanagari Hindi. Return ONLY the Hindi translation.
+Use real Devanagari Hindi.
+Return ONLY the Hindi translation.
 TEXT:
 {source}'''
-        models = [preferred_model] if preferred_model else []
-        models.extend(m for m in self._models() if m not in models)
+
+        models = []
+        if preferred_model:
+            models.append(preferred_model)
+        for model in self._models():
+            if model not in models:
+                models.append(model)
+
         for model in models:
+            # Plain-text attempt is preferred because it is less fragile than JSON.
             try:
-                response = self._call_model(model, plain_prompt, json_mode=False)
-                value = _strip_json_fence(response.text or "")
+                response = self._call_model(model, plain_prompt)
+                value = _strip_json_fence(self._response_text(response))
                 if _has_hindi(value):
                     return value
             except Exception:
                 pass
+
+            # Second attempt: ask for a tiny JSON object and recover it ourselves.
             try:
-                response = self._call_model(model, f'''Return ONLY JSON: {{"hindi":"..."}}\nTranslate to NCERT-style Hindi. Preserve __MATH_n__ tokens exactly.\nTEXT: {source}''', json_mode=False)
-                parsed = self._parse_response(response.text or "{}")
-                if parsed.get("__index_0"):
-                    return parsed["__index_0"]
+                response = self._call_model(
+                    model,
+                    f'''Return ONLY JSON in this exact form:
+{{"hindi":"..."}}
+Translate the following English text into formal NCERT-style Hindi.
+Preserve __MATH_n__ tokens, numbers, symbols and line breaks exactly.
+Do not explain or add anything.
+TEXT:
+{source}''',
+                )
+                parsed = self._parse_response(self._response_text(response))
+                value = parsed.get("__index_0", "").strip()
+                if _has_hindi(value):
+                    return value
             except Exception:
                 pass
+
+            # Third attempt: an extremely explicit one-line translation prompt.
+            try:
+                response = self._call_model(
+                    model,
+                    "Translate this English exam text to Hindi. Output only Devanagari Hindi and preserve math tokens exactly.\n" + source,
+                )
+                value = _strip_json_fence(self._response_text(response))
+                if _has_hindi(value):
+                    return value
+            except Exception:
+                pass
+
         return ""
 
     def _merge_question_block_text(self, blocks: list[dict]) -> list[dict]:
@@ -197,7 +275,8 @@ TEXT:
                 out.append(block)
                 continue
             prev = out[-1]
-            pb = prev.get("bbox", [0,0,0,0]); cb = block.get("bbox", [0,0,0,0])
+            pb = prev.get("bbox", [0, 0, 0, 0])
+            cb = block.get("bbox", [0, 0, 0, 0])
             same_page = prev.get("page") == block.get("page")
             same_col = prev.get("column") == block.get("column")
             vertical_gap = float(cb[1]) - float(pb[3])
@@ -213,7 +292,7 @@ TEXT:
                 prev["translation_source"] = (prev_source + " " + cur_source).strip()
                 prev["lines"] = list(prev.get("lines", [])) + list(block.get("lines", []))
                 prev["math_values"] = list(prev.get("math_values", [])) + list(block.get("math_values", []))
-                prev["bbox"] = [min(pb[0],cb[0]), min(pb[1],cb[1]), max(pb[2],cb[2]), max(pb[3],cb[3])]
+                prev["bbox"] = [min(pb[0], cb[0]), min(pb[1], cb[1]), max(pb[2], cb[2]), max(pb[3], cb[3])]
                 continue
             out.append(block)
         return out
@@ -222,12 +301,13 @@ TEXT:
         questions: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
         pending_section: str | None = None
-        started = False
         item_counter = 0
+
         def flush_question():
             nonlocal current
             if not current:
                 return
+
             current["blocks"] = self._merge_question_block_text(current["blocks"])
             queue = []
             for block in current["blocks"]:
@@ -243,9 +323,13 @@ TEXT:
                 translation_id = block.get("_translation_id")
                 if translation_id:
                     queue.append({"id": translation_id, "text": clean_source})
+
             translations = {}
-            for start in range(0, len(queue), 4):
-                translations.update(self._translate_batch(queue[start:start + 4]))
+            # Small batches are much more reliable for exam PDFs containing
+            # equations, options, labels and mixed typography.
+            for start in range(0, len(queue), 2):
+                translations.update(self._translate_batch(queue[start:start + 2]))
+
             for block in current["blocks"]:
                 if block.get("type") == "image":
                     block["hindi"] = ""
@@ -257,11 +341,14 @@ TEXT:
                         raise RuntimeError(f"Empty Hindi translation for question {current['number']}")
                     block["hindi"] = translated
                 block.pop("_translation_id", None)
+
             questions.append(current)
             current = None
+
         for page in document.get("pages", []):
             for block in page.get("blocks", []):
                 text = str(block.get("text", "") or "").strip()
+
                 if block.get("type") == "image":
                     if current is not None:
                         current["blocks"].append(dict(block))
@@ -272,21 +359,29 @@ TEXT:
                     flush_question()
                     pending_section = text.upper()
                     continue
+
                 qmatch = QUESTION_RE.match(text)
                 if qmatch:
                     flush_question()
-                    current = {"number": int(qmatch.group(1)), "section": pending_section, "blocks": []}
+                    current = {
+                        "number": int(qmatch.group(1)),
+                        "section": pending_section,
+                        "blocks": [],
+                    }
                     pending_section = None
-                    started = True
+
                 if current is None:
                     continue
+
                 copied = dict(block)
                 copied["english"] = text
                 copied["hindi"] = ""
                 item_counter += 1
                 copied["_translation_id"] = f"b{item_counter}"
                 current["blocks"].append(copied)
+
         if current:
             flush_question()
+
         questions.sort(key=lambda q: int(q.get("number", 0)))
         return {"questions": questions, "source": document}
