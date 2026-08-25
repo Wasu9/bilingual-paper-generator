@@ -56,9 +56,9 @@ def _remove_question_number(text: str) -> str:
 class DemoTranslator:
     """Gemini translator used by the paper-generation pipeline."""
 
-    def __init__(self):
-        self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        self.model = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
+    def __init__(self, api_key: str = ""):
+        self.api_key = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+        self.model = os.getenv("GEMINI_MODEL", "gemini-3.7-flash").strip()
         self.client = genai.Client(api_key=self.api_key) if self.api_key and genai else None
 
     def translate_text(self, text: str) -> str:
@@ -105,6 +105,7 @@ Rules:
 4. Preserve numbers, units, symbols, variables, mathematical expressions and option markers.
 5. Do not add explanations, answers, notes or commentary.
 6. Keep established NCERT technical terminology in Hindi; where there is no clear standard term, retain the technical English term.
+7. Never return an empty Hindi field.
 
 INPUT:
 """ + json.dumps(protected_items, ensure_ascii=False)
@@ -140,32 +141,37 @@ INPUT:
         questions: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
         pending_images: list[dict] = []
-        translation_queue: list[dict[str, str]] = []
-        item_counter = 0
 
         def flush_question():
-            nonlocal current, translation_queue
+            nonlocal current
             if not current:
                 return
 
+            queue = [
+                {"id": block["_translation_id"], "text": _remove_question_number(block["english"])}
+                for block in current["blocks"]
+                if block.get("type") == "text" and block.get("_translation_id")
+            ]
             translations: dict[str, str] = {}
-            for start in range(0, len(translation_queue), 24):
-                translations.update(self._translate_batch(translation_queue[start:start + 24]))
+            for start in range(0, len(queue), 12):
+                translations.update(self._translate_batch(queue[start:start + 12]))
 
             for block in current["blocks"]:
                 if block.get("type") == "image":
                     continue
                 translation_id = block.pop("_translation_id", None)
                 translated = translations.get(translation_id, "")
+                if not translated:
+                    raise RuntimeError(f"Empty Hindi translation for question {current['number']}")
                 number = _question_number(block.get("english", ""))
-                if number and translated and not QUESTION_RE.match(translated):
+                if number and not QUESTION_RE.match(translated):
                     translated = f"{number}. {translated}"
                 block["hindi"] = translated
 
             questions.append(current)
             current = None
-            translation_queue = []
 
+        item_counter = 0
         for page in document["pages"]:
             for block in page["blocks"]:
                 text = block.get("text", "")
@@ -195,10 +201,6 @@ INPUT:
                 copied["english"] = text
                 copied["hindi"] = ""
                 copied["_translation_id"] = translation_id
-                translation_queue.append({
-                    "id": translation_id,
-                    "text": _remove_question_number(text) if q else text,
-                })
                 current["blocks"].append(copied)
 
         flush_question()
