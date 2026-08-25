@@ -1,9 +1,4 @@
-"""English -> NCERT-style Hindi translation layer.
-
-Uses Gemini when GEMINI_API_KEY is configured. The source text is sent in
-numbered blocks so question numbering, options, formulas and symbols can be
-preserved while only natural-language English is translated.
-"""
+"""English -> NCERT-style Hindi translation layer."""
 
 import json
 import os
@@ -18,15 +13,20 @@ except ImportError:
     types = None
 
 QUESTION_RE = re.compile(r"^\s*(?:Q\.?\s*)?(\d{1,3})[\.\)]\s*")
-FORMULA_RE = re.compile(r"(?:[A-Za-z]\w*\s*=\s*[^,.;\n]+|[A-Za-z]+\d+(?:[A-Za-z0-9+\-]*)|[√∑∫∞≤≥≠≈∝±×÷→⇌πθλμρΩΔ]|\b\d+(?:\.\d+)?(?:\s*[×x/]\s*10\s*\^?\s*[−-]?\d+)?\b)")
+FORMULA_RE = re.compile(
+    r"(?:[A-Za-z]\w*\s*=\s*[^,.;\n]+|[A-Za-z]+\d+(?:[A-Za-z0-9+\-]*)|"
+    r"[√∑∫∞≤≥≠≈∝±×÷→⇌πθλμρΩΔ]|\b\d+(?:\.\d+)?(?:\s*[×x/]\s*10\s*\^?\s*[−-]?\d+)?\b)"
+)
 
 
 def _protect_formulas(text: str):
     formulas = []
+
     def repl(match):
         key = f"__FORMULA_{len(formulas)}__"
         formulas.append(match.group(0))
         return key
+
     return FORMULA_RE.sub(repl, text), formulas
 
 
@@ -44,8 +44,17 @@ def _strip_json_fence(text: str) -> str:
     return text.strip()
 
 
+def _question_number(text: str) -> str:
+    match = QUESTION_RE.match(text or "")
+    return match.group(1) if match else ""
+
+
+def _remove_question_number(text: str) -> str:
+    return QUESTION_RE.sub("", text or "", count=1).strip()
+
+
 class DemoTranslator:
-    """Gemini translator with a safe fallback when no API key is configured."""
+    """Gemini translator used by the paper-generation pipeline."""
 
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -56,21 +65,27 @@ class DemoTranslator:
         if not text:
             return ""
         if not self.client:
-            return "[Hindi translation pending]"
+            raise RuntimeError("GEMINI_API_KEY is not configured")
+
         protected, formulas = _protect_formulas(text)
         prompt = (
-            "Translate this exam-paper text into NCERT-style Hindi. Keep formulas, numbers, "
-            "units, symbols, variables, option letters and placeholders exactly unchanged. "
-            "Translate only natural-language English. Do not explain or add anything.\n\nSOURCE:\n" + protected
+            "Translate this competitive-exam paper text into NCERT-style Hindi. "
+            "Translate only natural-language English. Preserve formulas, numbers, units, "
+            "symbols, variables and mathematical expressions exactly. Do not solve, explain, "
+            "shorten or add anything. Return only the Hindi translation.\n\nSOURCE:\n" + protected
         )
-        response = self.client.models.generate_content(model=self.model, contents=prompt, config=types.GenerateContentConfig())
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0),
+        )
         return _restore_formulas((response.text or "").strip(), formulas)
 
     def _translate_batch(self, items: list[dict[str, str]]) -> dict[str, str]:
         if not items:
             return {}
         if not self.client:
-            return {item["id"]: "[Hindi translation pending]" for item in items}
+            raise RuntimeError("GEMINI_API_KEY is not configured")
 
         protected_items = []
         formula_maps: dict[str, list[str]] = {}
@@ -79,15 +94,17 @@ class DemoTranslator:
             formula_maps[item["id"]] = formulas
             protected_items.append({"id": item["id"], "text": protected})
 
-        prompt = """You are translating a competitive-exam paper from English to NCERT-style Hindi.
-Return ONLY a JSON array. For every input object, return exactly one object with the same id and a Hindi translation.
+        prompt = """Translate the following competitive-exam paper text from English to NCERT-style Hindi.
+Return ONLY a JSON array of objects in exactly this form:
+[{"id":"same-id","hindi":"translation"}]
+
 Rules:
-1. Preserve the exact meaning and wording; do not shorten or solve anything.
+1. Preserve the complete meaning and wording. Do not shorten or solve.
 2. Translate natural-language English into clear NCERT-style Hindi.
-3. Preserve every formula placeholder, number, unit, symbol, variable, option marker, and mathematical expression exactly.
-4. Do not translate placeholders such as __FORMULA_0__.
-5. Do not add explanations, answers, or commentary.
-6. Use standard NCERT Hindi terminology where established; otherwise retain technical English terms.
+3. Preserve every __FORMULA_n__ placeholder exactly; never translate or remove it.
+4. Preserve numbers, units, symbols, variables, mathematical expressions and option markers.
+5. Do not add explanations, answers, notes or commentary.
+6. Keep established NCERT technical terminology in Hindi; where there is no clear standard term, retain the technical English term.
 
 INPUT:
 """ + json.dumps(protected_items, ensure_ascii=False)
@@ -95,63 +112,93 @@ INPUT:
         response = self.client.models.generate_content(
             model=self.model,
             contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0,
+            ),
         )
+
         try:
             parsed = json.loads(_strip_json_fence(response.text or "[]"))
-        except json.JSONDecodeError:
-            return {item["id"]: "[Hindi translation failed]" for item in items}
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Gemini returned invalid translation JSON: {exc}") from exc
 
         result: dict[str, str] = {}
         for item in parsed if isinstance(parsed, list) else []:
             if isinstance(item, dict) and "id" in item:
                 item_id = str(item["id"])
-                result[item_id] = _restore_formulas(str(item.get("hindi", "")), formula_maps.get(item_id, []))
-        for item in items:
-            result.setdefault(item["id"], "[Hindi translation failed]")
+                result[item_id] = _restore_formulas(
+                    str(item.get("hindi", "")).strip(), formula_maps.get(item_id, [])
+                )
+
+        missing = [item["id"] for item in items if not result.get(item["id"])]
+        if missing:
+            raise RuntimeError("Gemini did not return translations for: " + ", ".join(missing))
         return result
 
     def translate_document(self, document: dict) -> dict:
-        questions = []
+        questions: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
-        pending_items: list[dict[str, str]] = []
+        pending_images: list[dict] = []
+        translation_queue: list[dict[str, str]] = []
         item_counter = 0
 
         def flush_question():
-            nonlocal current, pending_items
+            nonlocal current, translation_queue
             if not current:
                 return
-            translations = self._translate_batch(pending_items)
+
+            translations: dict[str, str] = {}
+            for start in range(0, len(translation_queue), 24):
+                translations.update(self._translate_batch(translation_queue[start:start + 24]))
+
             for block in current["blocks"]:
                 if block.get("type") == "image":
                     continue
-                block["hindi"] = translations.get(block["_translation_id"], "[Hindi translation failed]")
-                block.pop("_translation_id", None)
+                translation_id = block.pop("_translation_id", None)
+                translated = translations.get(translation_id, "")
+                number = _question_number(block.get("english", ""))
+                if number and translated and not QUESTION_RE.match(translated):
+                    translated = f"{number}. {translated}"
+                block["hindi"] = translated
+
             questions.append(current)
             current = None
-            pending_items = []
+            translation_queue = []
 
         for page in document["pages"]:
             for block in page["blocks"]:
                 text = block.get("text", "")
                 q = QUESTION_RE.match(text) if block.get("type") != "image" else None
+
                 if q:
                     flush_question()
                     current = {"number": int(q.group(1)), "blocks": []}
+                    if pending_images:
+                        current["blocks"].extend(pending_images)
+                        pending_images = []
+
                 if current is None:
+                    if block.get("type") == "image":
+                        pending_images.append(dict(block))
                     continue
 
                 copied = dict(block)
                 if block.get("type") == "image":
                     copied["english"] = ""
                     copied["hindi"] = ""
-                else:
-                    item_counter += 1
-                    translation_id = f"b{item_counter}"
-                    copied["english"] = text
-                    copied["hindi"] = ""
-                    copied["_translation_id"] = translation_id
-                    pending_items.append({"id": translation_id, "text": text})
+                    current["blocks"].append(copied)
+                    continue
+
+                item_counter += 1
+                translation_id = f"b{item_counter}"
+                copied["english"] = text
+                copied["hindi"] = ""
+                copied["_translation_id"] = translation_id
+                translation_queue.append({
+                    "id": translation_id,
+                    "text": _remove_question_number(text) if q else text,
+                })
                 current["blocks"].append(copied)
 
         flush_question()
