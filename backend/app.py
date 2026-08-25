@@ -18,7 +18,7 @@ OUTPUTS = BASE / "outputs"
 UPLOADS.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 
-app = FastAPI(title="Bilingual Paper Generator", version="0.2.0")
+app = FastAPI(title="Bilingual Paper Generator", version="0.3.0")
 app.mount("/static", StaticFiles(directory=str(BASE / "frontend")), name="static")
 
 
@@ -45,16 +45,21 @@ async def generate(file: UploadFile = File(...)):
 
     pdf_path.write_bytes(await file.read())
 
-    document = extract_document(pdf_path)
-    bilingual = translator.translate_document(document)
-    generate_docx(bilingual, docx_path)
+    try:
+        document = extract_document(pdf_path)
+        bilingual = translator.translate_document(document)
+        generate_docx(bilingual, docx_path)
+    except RuntimeError as exc:
+        raise HTTPException(502, f"Hindi translation failed: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(500, f"Paper generation failed: {exc}") from exc
 
     return {
         "job_id": job,
         "pages": len(document["pages"]),
         "questions": len(bilingual["questions"]),
         "download": f"/api/download/{docx_path.name}",
-        "note": "Generated with Gemini NCERT-style Hindi translation and layout-aware Word output.",
+        "note": "Generated with Gemini NCERT-style Hindi translation, continuous Word table, question-safe page breaks and source figures.",
     }
 
 
