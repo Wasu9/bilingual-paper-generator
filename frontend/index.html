@@ -15,9 +15,15 @@
       <h2>Upload English Paper PDF</h2>
       <form id="form">
         <input id="pdf" type="file" accept=".pdf" required>
-        <button type="submit">Generate Bilingual Word</button>
+        <button id="submit" type="submit">Generate Bilingual Word</button>
       </form>
       <div id="status"></div>
+      <div id="progressWrap" hidden style="margin-top:12px">
+        <div style="height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden">
+          <div id="progress" style="height:100%;width:0%;background:#111827;transition:width .3s"></div>
+        </div>
+        <div id="progressText" style="margin-top:6px;font-size:13px"></div>
+      </div>
       <a id="download" class="download" hidden></a>
     </section>
 
@@ -25,29 +31,34 @@
       <h3>Formatting rules</h3>
       <ul>
         <li>English text is kept as the source.</li>
-        <li>Hindi translation is separated from the source text.</li>
+        <li>Hindi translation is NCERT-style and placed with the English question.</li>
         <li>PDF coordinates are retained for layout analysis.</li>
         <li>Math/formulas are protected from translation.</li>
-        <li>Word output remains editable.</li>
+        <li>Figures/graphs are preserved where present in the source PDF.</li>
+        <li>Questions are kept page-safe in the editable Word output.</li>
       </ul>
     </section>
   </main>
 
 <script>
 const form = document.getElementById('form');
+const submit = document.getElementById('submit');
 const status = document.getElementById('status');
 const download = document.getElementById('download');
+const progressWrap = document.getElementById('progressWrap');
+const progress = document.getElementById('progress');
+const progressText = document.getElementById('progressText');
 
-async function readApiResponse(res) {
-  const raw = await res.text();
-  if (!raw) {
-    throw new Error(`Server returned an empty response (HTTP ${res.status}). Check the Codespace terminal.`);
-  }
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function readJsonResponse(res) {
+  const text = await res.text();
+  if (!text) throw new Error(`Server returned an empty response (HTTP ${res.status}). Check the Codespace terminal.`);
   let data;
   try {
-    data = JSON.parse(raw);
-  } catch (_) {
-    throw new Error(`Server returned invalid JSON (HTTP ${res.status}). ${raw.slice(0, 300)}`);
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Server returned invalid JSON (HTTP ${res.status}). ${text.slice(0, 300)}`);
   }
   if (!res.ok) throw new Error(data.detail || data.message || `Generation failed (HTTP ${res.status})`);
   return data;
@@ -55,27 +66,50 @@ async function readApiResponse(res) {
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
-  status.textContent = 'Processing PDF...';
-  download.hidden = true;
-
   const file = document.getElementById('pdf').files[0];
-  if (!file) {
-    status.textContent = 'Please select a PDF file.';
-    return;
-  }
+  if (!file) return;
+
+  submit.disabled = true;
+  status.textContent = 'Starting paper generation...';
+  download.hidden = true;
+  progressWrap.hidden = false;
+  progress.style.width = '3%';
+  progressText.textContent = 'Uploading PDF...';
 
   const fd = new FormData();
   fd.append('file', file);
 
   try {
     const res = await fetch('/api/generate', { method: 'POST', body: fd });
-    const data = await readApiResponse(res);
-    status.textContent = `Done: ${data.pages} page(s), ${data.questions} detected question(s).`;
-    download.href = data.download;
-    download.textContent = 'Download Word file';
-    download.hidden = false;
+    const data = await readJsonResponse(res);
+    const jobId = data.job_id;
+
+    let finished = false;
+    while (!finished) {
+      await sleep(1500);
+      const jobRes = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, { cache: 'no-store' });
+      const job = await readJsonResponse(jobRes);
+
+      progress.style.width = `${Math.max(3, Math.min(100, job.progress || 0))}%`;
+      progressText.textContent = `${job.progress || 0}% — ${job.message || 'Processing...'}`;
+      status.textContent = job.message || 'Processing PDF...';
+
+      if (job.status === 'done') {
+        finished = true;
+        status.textContent = `Done: ${job.pages} page(s), ${job.questions} question(s).`;
+        progress.style.width = '100%';
+        progressText.textContent = '100% — Word file ready.';
+        download.href = job.download;
+        download.textContent = 'Download Word file';
+        download.hidden = false;
+      } else if (job.status === 'error') {
+        throw new Error(job.message || 'Paper generation failed.');
+      }
+    }
   } catch (err) {
-    status.textContent = err.message || 'Generation failed.';
+    status.textContent = err.message || 'Paper generation failed.';
+  } finally {
+    submit.disabled = false;
   }
 });
 </script>
