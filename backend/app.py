@@ -18,7 +18,7 @@ OUTPUTS = BASE / "outputs"
 UPLOADS.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 
-app = FastAPI(title="Bilingual Paper Generator", version="0.4.0")
+app = FastAPI(title="Bilingual Paper Generator", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(BASE / "frontend")), name="static")
 
 
@@ -32,14 +32,14 @@ async def generate(
     file: UploadFile = File(...),
     gemini_api_key: str = Form(default=""),
 ):
-    if not file.filename.lower().endswith(".pdf"):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Please upload a PDF file.")
 
     translator = DemoTranslator(api_key=gemini_api_key)
     if not translator.client:
         raise HTTPException(
             400,
-            "Gemini API key missing. Enter your Gemini API key in the app, or configure GEMINI_API_KEY in .env.",
+            "Hindi translation is not configured. Enter your Gemini API key in the app or set GEMINI_API_KEY in .env.",
         )
 
     job = uuid4().hex
@@ -49,10 +49,16 @@ async def generate(
 
     try:
         document = extract_document(pdf_path)
+        if not document.get("pages"):
+            raise RuntimeError("No readable pages were found in the PDF.")
+
         bilingual = translator.translate_document(document)
+        if not bilingual.get("questions"):
+            raise RuntimeError("No questions were detected. The PDF layout could not be parsed.")
+
         generate_docx(bilingual, docx_path)
     except RuntimeError as exc:
-        raise HTTPException(502, f"Hindi translation failed: {exc}") from exc
+        raise HTTPException(502, f"Paper generation failed: {exc}") from exc
     except Exception as exc:
         raise HTTPException(500, f"Paper generation failed: {exc}") from exc
 
@@ -61,7 +67,7 @@ async def generate(
         "pages": len(document["pages"]),
         "questions": len(bilingual["questions"]),
         "download": f"/api/download/{docx_path.name}",
-        "note": "Continuous two-column Word table; each question is kept together; source diagrams are preserved.",
+        "note": "Professional continuous paper: English + Hindi, preserved figures, Word math objects where source math spans are available, and page-safe question blocks.",
     }
 
 
