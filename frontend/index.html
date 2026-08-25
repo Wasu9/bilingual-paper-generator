@@ -38,25 +38,44 @@ const form = document.getElementById('form');
 const status = document.getElementById('status');
 const download = document.getElementById('download');
 
+async function readApiResponse(res) {
+  const raw = await res.text();
+  if (!raw) {
+    throw new Error(`Server returned an empty response (HTTP ${res.status}). Check the Codespace terminal.`);
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (_) {
+    throw new Error(`Server returned invalid JSON (HTTP ${res.status}). ${raw.slice(0, 300)}`);
+  }
+  if (!res.ok) throw new Error(data.detail || data.message || `Generation failed (HTTP ${res.status})`);
+  return data;
+}
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   status.textContent = 'Processing PDF...';
   download.hidden = true;
 
+  const file = document.getElementById('pdf').files[0];
+  if (!file) {
+    status.textContent = 'Please select a PDF file.';
+    return;
+  }
+
   const fd = new FormData();
-  fd.append('file', document.getElementById('pdf').files[0]);
+  fd.append('file', file);
 
   try {
     const res = await fetch('/api/generate', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Generation failed');
-
+    const data = await readApiResponse(res);
     status.textContent = `Done: ${data.pages} page(s), ${data.questions} detected question(s).`;
     download.href = data.download;
     download.textContent = 'Download Word file';
     download.hidden = false;
   } catch (err) {
-    status.textContent = err.message;
+    status.textContent = err.message || 'Generation failed.';
   }
 });
 </script>
