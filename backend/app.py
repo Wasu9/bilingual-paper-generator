@@ -2,7 +2,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -18,7 +18,7 @@ OUTPUTS = BASE / "outputs"
 UPLOADS.mkdir(exist_ok=True)
 OUTPUTS.mkdir(exist_ok=True)
 
-app = FastAPI(title="Bilingual Paper Generator", version="0.3.0")
+app = FastAPI(title="Bilingual Paper Generator", version="0.4.0")
 app.mount("/static", StaticFiles(directory=str(BASE / "frontend")), name="static")
 
 
@@ -28,21 +28,23 @@ def home():
 
 
 @app.post("/api/generate")
-async def generate(file: UploadFile = File(...)):
+async def generate(
+    file: UploadFile = File(...),
+    gemini_api_key: str = Form(default=""),
+):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Please upload a PDF file.")
 
-    translator = DemoTranslator()
+    translator = DemoTranslator(api_key=gemini_api_key)
     if not translator.client:
         raise HTTPException(
-            500,
-            "GEMINI_API_KEY is not configured. Add it to the project's .env file and restart the server.",
+            400,
+            "Gemini API key missing. Enter your Gemini API key in the app, or configure GEMINI_API_KEY in .env.",
         )
 
     job = uuid4().hex
     pdf_path = UPLOADS / f"{job}.pdf"
     docx_path = OUTPUTS / f"bilingual_{job}.docx"
-
     pdf_path.write_bytes(await file.read())
 
     try:
@@ -59,7 +61,7 @@ async def generate(file: UploadFile = File(...)):
         "pages": len(document["pages"]),
         "questions": len(bilingual["questions"]),
         "download": f"/api/download/{docx_path.name}",
-        "note": "Generated with Gemini NCERT-style Hindi translation, continuous Word table, question-safe page breaks and source figures.",
+        "note": "Continuous two-column Word table; each question is kept together; source diagrams are preserved.",
     }
 
 
