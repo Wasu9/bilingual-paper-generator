@@ -13,37 +13,13 @@ def _is_hindi(text: str) -> bool:
     return any("\u0900" <= c <= "\u097F" for c in str(text or ""))
 
 
-def _set_run_font(run, text, size=10, bold=False):
+def _set_run_font(run, text, size=9.5, bold=False):
     run.bold = bold
     run.font.name = "Noto Sans Devanagari" if _is_hindi(text) else "Aptos"
     run.font.size = Pt(size)
 
 
-def _set_cell_text(cell, text, bold=False):
-    cell.text = ""
-    p = cell.paragraphs[0]
-    p.paragraph_format.space_after = Pt(0)
-    p.paragraph_format.space_before = Pt(0)
-    p.paragraph_format.line_spacing = 1.0
-    p.paragraph_format.keep_together = True
-    run = p.add_run(str(text or ""))
-    _set_run_font(run, str(text or ""), bold=bold)
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
-
-
-def _prevent_row_split(row):
-    tr_pr = row._tr.get_or_add_trPr()
-    if tr_pr.find(qn("w:cantSplit")) is None:
-        tr_pr.append(OxmlElement("w:cantSplit"))
-
-
-def _repeat_header_row(row):
-    tr_pr = row._tr.get_or_add_trPr()
-    if tr_pr.find(qn("w:tblHeader")) is None:
-        tr_pr.append(OxmlElement("w:tblHeader"))
-
-
-def _set_cell_margins(cell, top=55, start=75, bottom=55, end=75):
+def _set_cell_margins(cell, top=45, start=70, bottom=45, end=70):
     tc_pr = cell._tc.get_or_add_tcPr()
     tc_mar = tc_pr.first_child_found_in("w:tcMar")
     if tc_mar is None:
@@ -58,6 +34,18 @@ def _set_cell_margins(cell, top=55, start=75, bottom=55, end=75):
         node.set(qn("w:type"), "dxa")
 
 
+def _prevent_row_split(row):
+    tr_pr = row._tr.get_or_add_trPr()
+    if tr_pr.find(qn("w:cantSplit")) is None:
+        tr_pr.append(OxmlElement("w:cantSplit"))
+
+
+def _repeat_header_row(row):
+    tr_pr = row._tr.get_or_add_trPr()
+    if tr_pr.find(qn("w:tblHeader")) is None:
+        tr_pr.append(OxmlElement("w:tblHeader"))
+
+
 def _set_table_layout_fixed(table):
     tbl_pr = table._tbl.tblPr
     layout = tbl_pr.first_child_found_in("w:tblLayout")
@@ -67,42 +55,50 @@ def _set_table_layout_fixed(table):
     layout.set(qn("w:type"), "fixed")
 
 
-def _block_y(block):
-    return float((block.get("bbox") or [0, 0, 0, 0])[1])
+def _set_table_borders(table):
+    """Continuous table: outer border + English/Hindi divider, no box around every question."""
+    tbl_pr = table._tbl.tblPr
+    borders = tbl_pr.first_child_found_in("w:tblBorders")
+    if borders is None:
+        borders = OxmlElement("w:tblBorders")
+        tbl_pr.append(borders)
+
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        node = borders.find(qn(f"w:{side}"))
+        if node is None:
+            node = OxmlElement(f"w:{side}")
+            borders.append(node)
+        node.set(qn("w:val"), "single" if side in ("top", "left", "bottom", "right", "insideV") else "nil")
+        node.set(qn("w:sz"), "6")
+        node.set(qn("w:space"), "0")
+        node.set(qn("w:color"), "B7B7B7")
 
 
-def _group_blocks_by_visual_line(blocks):
-    ordered = sorted(blocks, key=lambda b: (_block_y(b), (b.get("bbox") or [0])[0]))
-    groups = []
-    for block in ordered:
-        y = _block_y(block)
-        if not groups or abs(y - groups[-1]["y"]) > 5:
-            groups.append({"y": y, "blocks": [block]})
-        else:
-            groups[-1]["blocks"].append(block)
-    return [g["blocks"] for g in groups]
-
-
-def _add_image(parent_cell, image_path, max_width=3.15):
-    if not image_path or not Path(image_path).exists():
-        return
-    p = parent_cell.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_before = Pt(2)
-    p.paragraph_format.space_after = Pt(2)
-    p.paragraph_format.keep_with_next = True
-    run = p.add_run()
-    run.add_picture(image_path, width=Inches(max_width))
-
-
-def _add_text(parent_cell, text, bold_number=False):
-    p = parent_cell.paragraphs[0] if not parent_cell.paragraphs[0].text else parent_cell.add_paragraph()
+def _clear_cell(cell):
+    cell.text = ""
+    p = cell.paragraphs[0]
     p.paragraph_format.space_after = Pt(0)
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.line_spacing = 1.0
     p.paragraph_format.keep_together = True
+    return p
 
-    text = str(text or "")
+
+def _add_text(parent_cell, text, bold_number=False, first=False):
+    if first and not parent_cell.paragraphs[0].text:
+        p = parent_cell.paragraphs[0]
+    else:
+        p = parent_cell.add_paragraph()
+
+    p.paragraph_format.space_after = Pt(1.5)
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.line_spacing = 1.0
+    p.paragraph_format.keep_together = True
+
+    text = str(text or "").strip()
+    if not text:
+        return
+
     match = re.match(r"^(\s*(?:Q\.?\s*)?\d{1,3}[\.\)])\s*(.*)$", text, flags=re.S)
     if bold_number and match:
         number_run = p.add_run(match.group(1) + " ")
@@ -114,71 +110,74 @@ def _add_text(parent_cell, text, bold_number=False):
         _set_run_font(run, text)
 
 
+def _add_image(parent_cell, image_path, max_width=3.15):
+    if not image_path or not Path(image_path).exists():
+        return
+    p = parent_cell.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(3)
+    p.paragraph_format.space_after = Pt(3)
+    p.paragraph_format.keep_together = True
+    run = p.add_run()
+    run.add_picture(image_path, width=Inches(max_width))
+
+
+def _sort_blocks(blocks):
+    return sorted(
+        blocks,
+        key=lambda b: (
+            float((b.get("bbox") or [0, 0, 0, 0])[1]),
+            float((b.get("bbox") or [0, 0, 0, 0])[0]),
+        ),
+    )
+
+
 def _add_visual_content(parent_cell, blocks, language_key):
-    groups = _group_blocks_by_visual_line(blocks)
-
-    for group_index, group in enumerate(groups):
-        image_blocks = [b for b in group if b.get("type") == "image" and b.get("image_path")]
-        text_blocks = [b for b in group if b.get("type") != "image" and b.get(language_key, "")]
-
-        if image_blocks:
-            for image in image_blocks:
-                _add_image(parent_cell, image.get("image_path"))
-
-        if not text_blocks:
-            continue
-
-        columns = []
-        for block in sorted(text_blocks, key=lambda b: (b.get("bbox") or [0])[0]):
-            column = block.get("column", 0)
-            if column not in columns:
-                columns.append(column)
-
-        if len(columns) == 1:
-            for block in sorted(text_blocks, key=lambda b: (b.get("bbox") or [0])[0]):
-                text = str(block.get(language_key, ""))
-                _add_text(parent_cell, text, bold_number=bool(re.match(r"^\s*(?:Q\.?\s*)?\d{1,3}[\.\)]", text)))
-            continue
-
-        nested = parent_cell.add_table(rows=1, cols=len(columns))
-        nested.style = "Table Grid"
-        nested.autofit = False
-        _set_table_layout_fixed(nested)
-        column_index = {column: index for index, column in enumerate(columns)}
-
-        for cell in nested.rows[0].cells:
-            _set_cell_margins(cell, top=35, start=45, bottom=35, end=45)
-
-        for block in sorted(text_blocks, key=lambda b: (b.get("bbox") or [0])[0]):
-            idx = column_index[block.get("column", 0)]
-            _set_cell_text(nested.rows[0].cells[idx], block.get(language_key, ""))
-
+    """Render one language in one cell without nested tables/boxes."""
     parent_cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+    first_text = True
+
+    for block in _sort_blocks(blocks):
+        if block.get("type") == "image":
+            _add_image(parent_cell, block.get("image_path"))
+            continue
+
+        text = str(block.get(language_key, "") or "").strip()
+        if not text:
+            continue
+
+        is_question = bool(re.match(r"^\s*(?:Q\.?\s*)?\d{1,3}[\.\)]", text))
+        _add_text(parent_cell, text, bold_number=is_question, first=first_text)
+        first_text = False
 
 
 def generate_docx(data: dict, output_path: Path):
     doc = Document()
     section = doc.sections[0]
-    section.top_margin = Inches(0.45)
-    section.bottom_margin = Inches(0.45)
+    section.top_margin = Inches(0.42)
+    section.bottom_margin = Inches(0.42)
     section.left_margin = Inches(0.45)
     section.right_margin = Inches(0.45)
 
-    # One continuous table for the complete paper. Each question is one row,
-    # so Word moves the entire question to the next page instead of splitting it.
+    # One continuous two-column table for the entire paper.
+    # Each question is exactly one row and cantSplit keeps the complete question together.
     table = doc.add_table(rows=1, cols=2)
-    table.style = "Table Grid"
     table.autofit = False
     _set_table_layout_fixed(table)
+    _set_table_borders(table)
 
     header = table.rows[0]
-    _set_cell_text(header.cells[0], "English", bold=True)
-    _set_cell_text(header.cells[1], "हिंदी", bold=True)
+    _clear_cell(header.cells[0]).add_run("English")
+    _clear_cell(header.cells[1]).add_run("हिंदी")
+    for cell, label in zip(header.cells, ("English", "हिंदी")):
+        p = cell.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in p.runs:
+            _set_run_font(run, label, size=10, bold=True)
+        _set_cell_margins(cell, top=55, start=70, bottom=55, end=70)
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
     _prevent_row_split(header)
     _repeat_header_row(header)
-    for cell in header.cells:
-        _set_cell_margins(cell)
-        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
 
     for question in data.get("questions", []):
         row = table.add_row()
@@ -187,6 +186,8 @@ def generate_docx(data: dict, output_path: Path):
         english_cell, hindi_cell = row.cells
         _set_cell_margins(english_cell)
         _set_cell_margins(hindi_cell)
+        _clear_cell(english_cell)
+        _clear_cell(hindi_cell)
 
         blocks = question.get("blocks", [])
         _add_visual_content(english_cell, blocks, "english")
